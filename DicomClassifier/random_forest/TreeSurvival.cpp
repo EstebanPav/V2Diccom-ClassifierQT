@@ -14,6 +14,7 @@
 #include <iostream>
 #include <iterator>
 #include <numeric>
+#include <fstream>
 
 #include "random_forest/utility.h"
 #include "TreeSurvival.h"
@@ -21,104 +22,125 @@
 
 namespace ranger {
 
-TreeSurvival::TreeSurvival(std::vector<double>* unique_timepoints, std::vector<size_t>* response_timepointIDs) :
-    unique_timepoints(unique_timepoints), response_timepointIDs(response_timepointIDs), num_deaths(0), num_samples_at_risk(
-        0) {
-  this->num_timepoints = unique_timepoints->size();
+TreeSurvival::TreeSurvival(double* unique_timepoints, size_t* response_timepointIDs, size_t num_timepoints) :
+    unique_timepoints(unique_timepoints), response_timepointIDs(response_timepointIDs), num_deaths(nullptr), num_samples_at_risk(nullptr), num_timepoints(num_timepoints) {
 }
 
-TreeSurvival::TreeSurvival(std::vector<std::vector<size_t>>& child_nodeIDs, std::vector<size_t>& split_varIDs,
-    std::vector<double>& split_values, std::vector<std::vector<double>> chf, std::vector<double>* unique_timepoints,
-    std::vector<size_t>* response_timepointIDs) :
-    Tree(child_nodeIDs, split_varIDs, split_values), unique_timepoints(unique_timepoints), response_timepointIDs(
-        response_timepointIDs), chf(chf), num_deaths(0), num_samples_at_risk(0) {
-  this->num_timepoints = unique_timepoints->size();
+TreeSurvival::TreeSurvival(size_t** child_nodeIDs, size_t* split_varIDs, double* split_values, double** chf,
+    double* unique_timepoints, size_t* response_timepointIDs, size_t num_timepoints) :
+    Tree(child_nodeIDs, split_varIDs, split_values), unique_timepoints(unique_timepoints), response_timepointIDs(response_timepointIDs), chf(chf), num_deaths(nullptr), num_samples_at_risk(nullptr), num_timepoints(num_timepoints) {
 }
 
 void TreeSurvival::allocateMemory() {
-  // Number of deaths and samples at risk for each timepoint
-  num_deaths.resize(num_timepoints);
-  num_samples_at_risk.resize(num_timepoints);
+    // Number of deaths and samples at risk for each timepoint
+    num_deaths = new size_t[num_timepoints];
+    num_samples_at_risk = new size_t[num_timepoints];
 }
 
 void TreeSurvival::appendToFileInternal(std::ofstream& file) {  // #nocov start
 
-  // Convert to vector without empty elements and save
-  std::vector<size_t> terminal_nodes;
-  std::vector<std::vector<double>> chf_vector;
-  for (size_t i = 0; i < chf.size(); ++i) {
-    if (!chf[i].empty()) {
-      terminal_nodes.push_back(i);
-      chf_vector.push_back(chf[i]);
+    // Convert to dynamic arrays without empty elements and save
+    size_t* terminal_nodes = new size_t[num_timepoints];
+    size_t terminal_nodes_count = 0;
+    double** chf_array = new double*[num_timepoints];
+    size_t chf_array_count = 0;
+
+    for (size_t i = 0; i < num_timepoints; ++i) {
+        if (chf[i] != nullptr) {
+            terminal_nodes[terminal_nodes_count++] = i;
+            chf_array[chf_array_count] = new double[num_timepoints];
+            std::copy(chf[i], chf[i] + num_timepoints, chf_array[chf_array_count]);
+            ++chf_array_count;
+        }
     }
-  }
-  saveVector1D(terminal_nodes, file);
-  saveVector2D(chf_vector, file);
+
+    saveArray1D(terminal_nodes, terminal_nodes_count, file);
+    saveArray2D(chf_array, chf_array_count, num_timepoints, file);
+
+    // Clean up
+    delete[] terminal_nodes;
+    for (size_t i = 0; i < chf_array_count; ++i) {
+        delete[] chf_array[i];
+    }
+    delete[] chf_array;
+
 } // #nocov end
 
 void TreeSurvival::createEmptyNodeInternal() {
-  chf.push_back(std::vector<double>());
+    chf = new double*[num_timepoints];
+    for (size_t i = 0; i < num_timepoints; ++i) {
+        chf[i] = nullptr;
+    }
 }
 
 void TreeSurvival::computeSurvival(size_t nodeID) {
-  std::vector<double> chf_temp;
-  chf_temp.reserve(num_timepoints);
-  double chf_value = 0;
-  for (size_t i = 0; i < num_timepoints; ++i) {
-    if (num_samples_at_risk[i] != 0) {
-      chf_value += (double) num_deaths[i] / (double) num_samples_at_risk[i];
+    double* chf_temp = new double[num_timepoints];
+    double chf_value = 0;
+    for (size_t i = 0; i < num_timepoints; ++i) {
+        if (num_samples_at_risk[i] != 0) {
+            chf_value += static_cast<double>(num_deaths[i]) / static_cast<double>(num_samples_at_risk[i]);
+        }
+        chf_temp[i] = chf_value;
     }
-    chf_temp.push_back(chf_value);
-  }
-  chf[nodeID] = chf_temp;
+    chf[nodeID] = chf_temp;
 }
 
-double TreeSurvival::computePredictionAccuracyInternal(std::vector<double>* prediction_error_casewise) {
+double TreeSurvival::computePredictionAccuracyInternal(double* prediction_error_casewise) {
 
-  // Compute summed chf for samples
-  std::vector<double> sum_chf;
-  for (size_t i = 0; i < prediction_terminal_nodeIDs.size(); ++i) {
-    size_t terminal_nodeID = prediction_terminal_nodeIDs[i];
-    sum_chf.push_back(std::accumulate(chf[terminal_nodeID].begin(), chf[terminal_nodeID].end(), 0.0));
-  }
-
-  // Return concordance index
-  return computeConcordanceIndex(*data, sum_chf, oob_sampleIDs, prediction_error_casewise);
-}
-
-bool TreeSurvival::splitNodeInternal(size_t nodeID, std::vector<size_t>& possible_split_varIDs) {
-
-  // Stop if node is pure
-  bool pure = true;
-  double pure_time = 0;
-  double pure_status = 0;
-  for (size_t pos = start_pos[nodeID]; pos < end_pos[nodeID]; ++pos) {
-    size_t sampleID = sampleIDs[pos];
-    double time = data->get_y(sampleID, 0);
-    double status = data->get_y(sampleID, 1);
-    if (pos != start_pos[nodeID] && (time != pure_time || status != pure_status)) {
-      pure = false;
-      break;
+    // Compute summed chf for samples
+    double* sum_chf = new double[prediction_terminal_nodeIDs.size()];
+    size_t sum_chf_count = 0;
+    for (size_t i = 0; i < prediction_terminal_nodeIDs.size(); ++i) {
+        size_t terminal_nodeID = prediction_terminal_nodeIDs[i];
+        double sum = std::accumulate(chf[terminal_nodeID], chf[terminal_nodeID] + num_timepoints, 0.0);
+        sum_chf[sum_chf_count++] = sum;
     }
-    pure_time = time;
-    pure_status = status;
-  }
-  if (pure) {
-    computeDeathCounts(nodeID);
-    computeSurvival(nodeID);
-    return true;
-  }
 
-  if (splitrule == MAXSTAT) {
-    return findBestSplitMaxstat(nodeID, possible_split_varIDs);
-  } else if (splitrule == EXTRATREES) {
-    return findBestSplitExtraTrees(nodeID, possible_split_varIDs);
-  } else {
-    return findBestSplit(nodeID, possible_split_varIDs);
-  }
+    // Return concordance index
+    double result = computeConcordanceIndex(*data, sum_chf, oob_sampleIDs, prediction_error_casewise);
+
+    // Clean up
+    delete[] sum_chf;
+
+    return result;
 }
 
-bool TreeSurvival::findBestSplit(size_t nodeID, std::vector<size_t>& possible_split_varIDs) {
+bool TreeSurvival::splitNodeInternal(size_t nodeID, size_t* possible_split_varIDs, size_t num_possible_split_varIDs) {
+
+    // Stop if node is pure
+    bool pure = true;
+    double pure_time = 0;
+    double pure_status = 0;
+    for (size_t pos = start_pos[nodeID]; pos < end_pos[nodeID]; ++pos) {
+        size_t sampleID = sampleIDs[pos];
+        double time = data->get_y(sampleID, 0);
+        double status = data->get_y(sampleID, 1);
+        if (pos != start_pos[nodeID] && (time != pure_time || status != pure_status)) {
+            pure = false;
+            break;
+        }
+        pure_time = time;
+        pure_status = status;
+    }
+    if (pure) {
+        computeDeathCounts(nodeID);
+        computeSurvival(nodeID);
+        return true;
+    }
+
+    if (splitrule == MAXSTAT) {
+        return findBestSplitMaxstat(nodeID, possible_split_varIDs, num_possible_split_varIDs);
+    } else if (splitrule == EXTRATREES) {
+        return findBestSplitExtraTrees(nodeID, possible_split_varIDs, num_possible_split_varIDs);
+    } else {
+        return findBestSplit(nodeID, possible_split_varIDs, num_possible_split_varIDs);
+    }
+}
+
+}
+
+/////////////////////////////////////////////////////////////////////////////
+bool TreeSurvival::findBestSplit(size_t nodeID, size_t* possible_split_varIDs, size_t num_split_vars) {
 
   double best_decrease = -1;
   size_t num_samples_node = end_pos[nodeID] - start_pos[nodeID];
@@ -133,11 +155,12 @@ bool TreeSurvival::findBestSplit(size_t nodeID, std::vector<size_t>& possible_sp
     return true;
   }
 
-  // Stop early if no split posssible
+  // Stop early if no split possible
   if (num_samples_node >= 2 * min_node_size) {
 
     // For all possible split variables
-    for (auto& varID : possible_split_varIDs) {
+    for (size_t i = 0; i < num_split_vars; ++i) {
+      size_t varID = possible_split_varIDs[i];
 
       // Find best split value, if ordered consider all values as split values, else all 2-partitions
       if (data->isOrderedVariable(varID)) {
@@ -174,7 +197,7 @@ bool TreeSurvival::findBestSplit(size_t nodeID, std::vector<size_t>& possible_sp
   }
 }
 
-bool TreeSurvival::findBestSplitMaxstat(size_t nodeID, std::vector<size_t>& possible_split_varIDs) {
+bool TreeSurvival::findBestSplitMaxstat(size_t nodeID, size_t* possible_split_varIDs, size_t num_split_vars) {
 
   size_t num_samples_node = end_pos[nodeID] - start_pos[nodeID];
 
@@ -186,52 +209,47 @@ bool TreeSurvival::findBestSplitMaxstat(size_t nodeID, std::vector<size_t>& poss
   }
 
   // Compute scores
-  std::vector<double> time;
-  time.reserve(num_samples_node);
-  std::vector<double> status;
-  status.reserve(num_samples_node);
-  for (size_t pos = start_pos[nodeID]; pos < end_pos[nodeID]; ++pos) {
-    size_t sampleID = sampleIDs[pos];
-    time.push_back(data->get_y(sampleID, 0));
-    status.push_back(data->get_y(sampleID, 1));
+  double* time = new double[num_samples_node];
+  double* status = new double[num_samples_node];
+  size_t pos = 0;
+  for (size_t i = start_pos[nodeID]; i < end_pos[nodeID]; ++i) {
+    size_t sampleID = sampleIDs[i];
+    time[pos] = data->get_y(sampleID, 0);
+    status[pos] = data->get_y(sampleID, 1);
+    ++pos;
   }
-  std::vector<double> scores = logrankScores(time, status);
+  std::vector<double> scores = logrankScores(std::vector<double>(time, time + num_samples_node), std::vector<double>(status, status + num_samples_node));
 
   // Save split stats
-  std::vector<double> pvalues;
-  pvalues.reserve(possible_split_varIDs.size());
-  std::vector<double> values;
-  values.reserve(possible_split_varIDs.size());
-  std::vector<double> candidate_varIDs;
-  candidate_varIDs.reserve(possible_split_varIDs.size());
-  std::vector<double> test_statistics;
-  test_statistics.reserve(possible_split_varIDs.size());
+  double* pvalues = new double[num_split_vars];
+  double* values = new double[num_split_vars];
+  double* candidate_varIDs = new double[num_split_vars];
+  double* test_statistics = new double[num_split_vars];
+
+  size_t index = 0;
 
   // Compute p-values
-  for (auto& varID : possible_split_varIDs) {
+  for (size_t i = 0; i < num_split_vars; ++i) {
+    size_t varID = possible_split_varIDs[i];
 
     // Get all observations
-    std::vector<double> x;
-    x.reserve(num_samples_node);
-    for (size_t pos = start_pos[nodeID]; pos < end_pos[nodeID]; ++pos) {
-      size_t sampleID = sampleIDs[pos];
-      x.push_back(data->get_x(sampleID, varID));
+    double* x = new double[num_samples_node];
+    for (size_t j = start_pos[nodeID]; j < end_pos[nodeID]; ++j) {
+      size_t sampleID = sampleIDs[j];
+      x[j - start_pos[nodeID]] = data->get_x(sampleID, varID);
     }
 
     // Order by x
-    std::vector<size_t> indices = order(x, false);
-    //std::vector<size_t> indices = orderInData(data, sampleIDs[nodeID], varID, false);
+    std::vector<size_t> indices = order(std::vector<double>(x, x + num_samples_node), false);
 
     // Compute maximally selected rank statistics
     double best_maxstat;
     double best_split_value;
-    maxstat(scores, x, indices, best_maxstat, best_split_value, minprop, 1 - minprop);
-    //maxstatInData(scores, data, sampleIDs[nodeID], varID, indices, best_maxstat, best_split_value, minprop, 1 - minprop);
+    maxstat(std::vector<double>(scores.begin(), scores.end()), std::vector<double>(x, x + num_samples_node), indices, best_maxstat, best_split_value, minprop, 1 - minprop);
 
     if (best_maxstat > -1) {
       // Compute number of samples left of cutpoints
-      std::vector<size_t> num_samples_left = numSamplesLeftOfCutpoint(x, indices);
-      //std::vector<size_t> num_samples_left = numSamplesLeftOfCutpointInData(data, sampleIDs[nodeID], varID, indices);
+      std::vector<size_t> num_samples_left = numSamplesLeftOfCutpoint(std::vector<double>(x, x + num_samples_node), indices);
 
       // Remove largest cutpoint (all observations left)
       num_samples_left.pop_back();
@@ -251,11 +269,14 @@ bool TreeSurvival::findBestSplitMaxstat(size_t nodeID, std::vector<size_t>& poss
       }
 
       // Save split stats
-      pvalues.push_back(pvalue);
-      values.push_back(best_split_value);
-      candidate_varIDs.push_back(varID);
-      test_statistics.push_back(best_maxstat);
+      pvalues[index] = pvalue;
+      values[index] = best_split_value;
+      candidate_varIDs[index] = varID;
+      test_statistics[index] = best_maxstat;
+      ++index;
     }
+
+    delete[] x;
   }
 
   double adjusted_best_pvalue = std::numeric_limits<double>::max();
@@ -263,21 +284,28 @@ bool TreeSurvival::findBestSplitMaxstat(size_t nodeID, std::vector<size_t>& poss
   double best_value = 0;
   double best_maxstat = 0;
 
-  if (pvalues.size() > 0) {
+  if (index > 0) {
     // Adjust p-values with Benjamini/Hochberg
-    std::vector<double> adjusted_pvalues = adjustPvalues(pvalues);
+    std::vector<double> adjusted_pvalues = adjustPvalues(std::vector<double>(pvalues, pvalues + index));
 
     double min_pvalue = std::numeric_limits<double>::max();
-    for (size_t i = 0; i < pvalues.size(); ++i) {
+    for (size_t i = 0; i < index; ++i) {
       if (pvalues[i] < min_pvalue) {
         min_pvalue = pvalues[i];
-        best_varID = candidate_varIDs[i];
+        best_varID = static_cast<size_t>(candidate_varIDs[i]);
         best_value = values[i];
         adjusted_best_pvalue = adjusted_pvalues[i];
         best_maxstat = test_statistics[i];
       }
     }
   }
+
+  delete[] time;
+  delete[] status;
+  delete[] pvalues;
+  delete[] values;
+  delete[] candidate_varIDs;
+  delete[] test_statistics;
 
   // Stop and save CHF if no good split found (this is terminal node).
   if (adjusted_best_pvalue > alpha) {
@@ -326,11 +354,13 @@ void TreeSurvival::computeDeathCounts(size_t nodeID) {
   }
 }
 
-void TreeSurvival::computeChildDeathCounts(size_t nodeID, size_t varID, std::vector<double>& possible_split_values,
-    std::vector<size_t>& num_samples_right_child, std::vector<size_t>& delta_samples_at_risk_right_child,
-    std::vector<size_t>& num_deaths_right_child, size_t num_splits) {
 
-  // Count deaths in right child per timepoint and possbile split
+/////////////////////////////////////////////////////////////////////////////
+void TreeSurvival::computeChildDeathCounts(size_t nodeID, size_t varID, double* possible_split_values,
+    size_t* num_samples_right_child, size_t* delta_samples_at_risk_right_child,
+    size_t* num_deaths_right_child, size_t num_splits) {
+
+  // Count deaths in right child per timepoint and possible split
   for (size_t pos = start_pos[nodeID]; pos < end_pos[nodeID]; ++pos) {
     size_t sampleID = sampleIDs[pos];
     double value = data->get_x(sampleID, varID);
@@ -338,7 +368,6 @@ void TreeSurvival::computeChildDeathCounts(size_t nodeID, size_t varID, std::vec
 
     // Count deaths until split_value reached
     for (size_t i = 0; i < num_splits; ++i) {
-
       if (value > possible_split_values[i]) {
         ++num_samples_right_child[i];
         ++delta_samples_at_risk_right_child[i * num_timepoints + survival_timeID];
@@ -358,21 +387,22 @@ void TreeSurvival::findBestSplitValueLogRank(size_t nodeID, size_t varID, double
   size_t num_samples_node = end_pos[nodeID] - start_pos[nodeID];
 
   // Create possible split values
-  std::vector<double> possible_split_values;
-  data->getAllValues(possible_split_values, sampleIDs, varID, start_pos[nodeID], end_pos[nodeID]);
+  double* possible_split_values = new double[num_samples_node];
+  size_t num_split_values = data->getAllValues(possible_split_values, sampleIDs, varID, start_pos[nodeID], end_pos[nodeID]);
 
   // Try next variable if all equal for this
-  if (possible_split_values.size() < 2) {
+  if (num_split_values < 2) {
+    delete[] possible_split_values;
     return;
   }
 
   // -1 because no split possible at largest value
-  size_t num_splits = possible_split_values.size() - 1;
+  size_t num_splits = num_split_values - 1;
 
   // Initialize
-  std::vector<size_t> num_deaths_right_child(num_splits * num_timepoints);
-  std::vector<size_t> delta_samples_at_risk_right_child(num_splits * num_timepoints);
-  std::vector<size_t> num_samples_right_child(num_splits);
+  size_t* num_deaths_right_child = new size_t[num_splits * num_timepoints]();
+  size_t* delta_samples_at_risk_right_child = new size_t[num_splits * num_timepoints]();
+  size_t* num_samples_right_child = new size_t[num_splits]();
 
   computeChildDeathCounts(nodeID, varID, possible_split_values, num_samples_right_child,
       delta_samples_at_risk_right_child, num_deaths_right_child, num_splits);
@@ -396,18 +426,17 @@ void TreeSurvival::findBestSplitValueLogRank(size_t nodeID, size_t varID, double
       }
 
       if (num_deaths[t] > 0) {
-        // Numerator and demoninator for log-rank test, notation from Ishwaran et al.
-        double di = (double) num_deaths[t];
-        double di1 = (double) num_deaths_right_child[i * num_timepoints + t];
-        double Yi = (double) num_samples_at_risk[t];
-        double Yi1 = (double) num_samples_at_risk_right_child;
+        // Numerator and denominator for log-rank test, notation from Ishwaran et al.
+        double di = static_cast<double>(num_deaths[t]);
+        double di1 = static_cast<double>(num_deaths_right_child[i * num_timepoints + t]);
+        double Yi = static_cast<double>(num_samples_at_risk[t]);
+        double Yi1 = static_cast<double>(num_samples_at_risk_right_child);
         numerator += di1 - Yi1 * (di / Yi);
         denominator_squared += (Yi1 / Yi) * (1.0 - Yi1 / Yi) * ((Yi - di) / (Yi - 1)) * di;
       }
 
       // Reduce number of samples at risk for next timepoint
       num_samples_at_risk_right_child -= delta_samples_at_risk_right_child[i * num_timepoints + t];
-
     }
     double logrank = -1;
     if (denominator_squared != 0) {
@@ -428,6 +457,11 @@ void TreeSurvival::findBestSplitValueLogRank(size_t nodeID, size_t varID, double
       }
     }
   }
+
+  delete[] possible_split_values;
+  delete[] num_deaths_right_child;
+  delete[] delta_samples_at_risk_right_child;
+  delete[] num_samples_right_child;
 }
 
 void TreeSurvival::findBestSplitValueLogRankUnordered(size_t nodeID, size_t varID, double& best_value,
@@ -436,16 +470,17 @@ void TreeSurvival::findBestSplitValueLogRankUnordered(size_t nodeID, size_t varI
   size_t num_samples_node = end_pos[nodeID] - start_pos[nodeID];
 
   // Create possible split values
-  std::vector<double> factor_levels;
-  data->getAllValues(factor_levels, sampleIDs, varID, start_pos[nodeID], end_pos[nodeID]);
+  double* factor_levels = new double[num_samples_node];
+  size_t num_factor_levels = data->getAllValues(factor_levels, sampleIDs, varID, start_pos[nodeID], end_pos[nodeID]);
 
   // Try next variable if all equal for this
-  if (factor_levels.size() < 2) {
+  if (num_factor_levels < 2) {
+    delete[] factor_levels;
     return;
   }
 
   // Number of possible splits is 2^num_levels
-  size_t num_splits = (1ULL << factor_levels.size());
+  size_t num_splits = (1ULL << num_factor_levels);
 
   // Compute logrank test statistic for each possible split
   // Split where all left (0) or all right (1) are excluded
@@ -454,7 +489,7 @@ void TreeSurvival::findBestSplitValueLogRankUnordered(size_t nodeID, size_t varI
 
     // Compute overall splitID by shifting local factorIDs to global positions
     size_t splitID = 0;
-    for (size_t j = 0; j < factor_levels.size(); ++j) {
+    for (size_t j = 0; j < num_factor_levels; ++j) {
       if ((local_splitID & (1ULL << j))) {
         double level = factor_levels[j];
         size_t factorID = floor(level) - 1;
@@ -463,8 +498,8 @@ void TreeSurvival::findBestSplitValueLogRankUnordered(size_t nodeID, size_t varI
     }
 
     // Initialize
-    std::vector<size_t> num_deaths_right_child(num_timepoints);
-    std::vector<size_t> delta_samples_at_risk_right_child(num_timepoints);
+    size_t* num_deaths_right_child = new size_t[num_timepoints]();
+    size_t* delta_samples_at_risk_right_child = new size_t[num_timepoints]();
     size_t num_samples_right_child = 0;
     double numerator = 0;
     double denominator_squared = 0;
@@ -485,12 +520,13 @@ void TreeSurvival::findBestSplitValueLogRankUnordered(size_t nodeID, size_t varI
           ++num_deaths_right_child[survival_timeID];
         }
       }
-
     }
 
     // Stop if minimal node size reached
     size_t num_samples_left_child = num_samples_node - num_samples_right_child;
     if (num_samples_right_child < min_node_size || num_samples_left_child < min_node_size) {
+      delete[] num_deaths_right_child;
+      delete[] delta_samples_at_risk_right_child;
       continue;
     }
 
@@ -502,11 +538,11 @@ void TreeSurvival::findBestSplitValueLogRankUnordered(size_t nodeID, size_t varI
       }
 
       if (num_deaths[t] > 0) {
-        // Numerator and demoninator for log-rank test, notation from Ishwaran et al.
-        double di = (double) num_deaths[t];
-        double di1 = (double) num_deaths_right_child[t];
-        double Yi = (double) num_samples_at_risk[t];
-        double Yi1 = (double) num_samples_at_risk_right_child;
+        // Numerator and denominator for log-rank test, notation from Ishwaran et al.
+        double di = static_cast<double>(num_deaths[t]);
+        double di1 = static_cast<double>(num_deaths_right_child[t]);
+        double Yi = static_cast<double>(num_samples_at_risk[t]);
+        double Yi1 = static_cast<double>(num_samples_at_risk_right_child);
         numerator += di1 - Yi1 * (di / Yi);
         denominator_squared += (Yi1 / Yi) * (1.0 - Yi1 / Yi) * ((Yi - di) / (Yi - 1)) * di;
       }
@@ -527,29 +563,39 @@ void TreeSurvival::findBestSplitValueLogRankUnordered(size_t nodeID, size_t varI
       best_varID = varID;
       best_logrank = logrank;
     }
+
+    delete[] num_deaths_right_child;
+    delete[] delta_samples_at_risk_right_child;
   }
+
+  delete[] factor_levels;
 }
 
+/////////////////////////////////////////////////////////////////////////////
 void TreeSurvival::findBestSplitValueAUC(size_t nodeID, size_t varID, double& best_value, size_t& best_varID,
     double& best_auc) {
 
   // Create possible split values
-  std::vector<double> possible_split_values;
-  data->getAllValues(possible_split_values, sampleIDs, varID, start_pos[nodeID], end_pos[nodeID]);
+  size_t num_node_samples = end_pos[nodeID] - start_pos[nodeID];
+  double* possible_split_values = new double[num_node_samples];
+  size_t num_split_values = data->getAllValues(possible_split_values, sampleIDs, varID, start_pos[nodeID], end_pos[nodeID]);
 
   // Try next variable if all equal for this
-  if (possible_split_values.size() < 2) {
+  if (num_split_values < 2) {
+    delete[] possible_split_values;
     return;
   }
 
-  size_t num_node_samples = end_pos[nodeID] - start_pos[nodeID];
-  size_t num_splits = possible_split_values.size() - 1;
+  size_t num_splits = num_split_values - 1;
   size_t num_possible_pairs = num_node_samples * (num_node_samples - 1) / 2;
 
   // Initialize
-  std::vector<double> num_count(num_splits, num_possible_pairs);
-  std::vector<double> num_total(num_splits, num_possible_pairs);
-  std::vector<size_t> num_samples_left_child(num_splits);
+  double* num_count = new double[num_splits];
+  double* num_total = new double[num_splits];
+  size_t* num_samples_left_child = new size_t[num_splits]();
+
+  std::fill(num_count, num_count + num_splits, num_possible_pairs);
+  std::fill(num_total, num_total + num_splits, num_possible_pairs);
 
   // For all pairs
   for (size_t k = start_pos[nodeID]; k < end_pos[nodeID]; ++k) {
@@ -573,8 +619,8 @@ void TreeSurvival::findBestSplitValueAUC(size_t nodeID, size_t varID, double& be
       double value_l = data->get_x(sample_l, varID);
 
       // Compute split
-      computeAucSplit(time_k, time_l, status_k, status_l, value_k, value_l, num_splits, possible_split_values,
-          num_count, num_total);
+      computeAucSplit(time_k, time_l, status_k, status_l, value_k, value_l, num_splits,
+          possible_split_values, num_count, num_total);
     }
   }
 
@@ -601,11 +647,16 @@ void TreeSurvival::findBestSplitValueAUC(size_t nodeID, size_t varID, double& be
       }
     }
   }
+
+  // Clean up
+  delete[] possible_split_values;
+  delete[] num_count;
+  delete[] num_total;
+  delete[] num_samples_left_child;
 }
 
 void TreeSurvival::computeAucSplit(double time_k, double time_l, double status_k, double status_l, double value_k,
-    double value_l, size_t num_splits, std::vector<double>& possible_split_values, std::vector<double>& num_count,
-    std::vector<double>& num_total) {
+    double value_l, size_t num_splits, double* possible_split_values, double* num_count, double* num_total) {
 
   bool ignore_pair = false;
   bool do_nothing = false;
@@ -666,10 +717,10 @@ void TreeSurvival::computeAucSplit(double time_k, double time_l, double status_k
       }
     }
   }
-
 }
 
-bool TreeSurvival::findBestSplitExtraTrees(size_t nodeID, std::vector<size_t>& possible_split_varIDs) {
+/////////////////////////////////////////////////////////////////////////////
+bool TreeSurvival::findBestSplitExtraTrees(size_t nodeID, size_t* possible_split_varIDs, size_t num_possible_split_varIDs) {
 
   double best_decrease = -1;
   size_t num_samples_node = end_pos[nodeID] - start_pos[nodeID];
@@ -684,11 +735,12 @@ bool TreeSurvival::findBestSplitExtraTrees(size_t nodeID, std::vector<size_t>& p
     return true;
   }
 
-  // Stop early if no split posssible
+  // Stop early if no split possible
   if (num_samples_node >= 2 * min_node_size) {
 
     // For all possible split variables
-    for (auto& varID : possible_split_varIDs) {
+    for (size_t i = 0; i < num_possible_split_varIDs; ++i) {
+      size_t varID = possible_split_varIDs[i];
 
       // Find best split value, if ordered consider all values as split values, else all 2-partitions
       if (data->isOrderedVariable(varID)) {
@@ -696,7 +748,6 @@ bool TreeSurvival::findBestSplitExtraTrees(size_t nodeID, std::vector<size_t>& p
       } else {
         findBestSplitValueExtraTreesUnordered(nodeID, varID, best_value, best_varID, best_decrease);
       }
-
     }
   }
 
@@ -721,8 +772,9 @@ bool TreeSurvival::findBestSplitExtraTrees(size_t nodeID, std::vector<size_t>& p
   }
 }
 
-void TreeSurvival::findBestSplitValueExtraTrees(size_t nodeID, size_t varID, double& best_value, size_t& best_varID,
-    double& best_logrank) {
+/////////////////////////////////////////////////////////////////////////////
+void TreeSurvival::findBestSplitValueExtraTrees(size_t nodeID, size_t varID, double* best_value, size_t* best_varID,
+    double* best_logrank) {
 
   size_t num_samples_node = end_pos[nodeID] - start_pos[nodeID];
 
@@ -737,22 +789,21 @@ void TreeSurvival::findBestSplitValueExtraTrees(size_t nodeID, size_t varID, dou
   }
 
   // Create possible split values: Draw randomly between min and max
-  std::vector<double> possible_split_values;
+  double* possible_split_values = new double[num_random_splits];
   std::uniform_real_distribution<double> udist(min, max);
-  possible_split_values.reserve(num_random_splits);
   for (size_t i = 0; i < num_random_splits; ++i) {
-    possible_split_values.push_back(udist(random_number_generator));
+    possible_split_values[i] = udist(random_number_generator);
   }
   if (num_random_splits > 1) {
-    std::sort(possible_split_values.begin(), possible_split_values.end());
+    std::sort(possible_split_values, possible_split_values + num_random_splits);
   }
 
-  size_t num_splits = possible_split_values.size();
+  size_t num_splits = num_random_splits;
 
   // Initialize
-  std::vector<size_t> num_deaths_right_child(num_splits * num_timepoints);
-  std::vector<size_t> delta_samples_at_risk_right_child(num_splits * num_timepoints);
-  std::vector<size_t> num_samples_right_child(num_splits);
+  size_t* num_deaths_right_child = new size_t[num_splits * num_timepoints];
+  size_t* delta_samples_at_risk_right_child = new size_t[num_splits * num_timepoints];
+  size_t* num_samples_right_child = new size_t[num_splits];
 
   computeChildDeathCounts(nodeID, varID, possible_split_values, num_samples_right_child,
       delta_samples_at_risk_right_child, num_deaths_right_child, num_splits);
@@ -776,11 +827,11 @@ void TreeSurvival::findBestSplitValueExtraTrees(size_t nodeID, size_t varID, dou
       }
 
       if (num_deaths[t] > 0) {
-        // Numerator and demoninator for log-rank test, notation from Ishwaran et al.
-        double di = (double) num_deaths[t];
-        double di1 = (double) num_deaths_right_child[i * num_timepoints + t];
-        double Yi = (double) num_samples_at_risk[t];
-        double Yi1 = (double) num_samples_at_risk_right_child;
+        // Numerator and denominator for log-rank test, notation from Ishwaran et al.
+        double di = static_cast<double>(num_deaths[t]);
+        double di1 = static_cast<double>(num_deaths_right_child[i * num_timepoints + t]);
+        double Yi = static_cast<double>(num_samples_at_risk[t]);
+        double Yi1 = static_cast<double>(num_samples_at_risk_right_child);
         numerator += di1 - Yi1 * (di / Yi);
         denominator_squared += (Yi1 / Yi) * (1.0 - Yi1 / Yi) * ((Yi - di) / (Yi - 1)) * di;
       }
@@ -797,22 +848,29 @@ void TreeSurvival::findBestSplitValueExtraTrees(size_t nodeID, size_t varID, dou
     // Regularization
     regularize(logrank, varID);
 
-    if (logrank > best_logrank) {
-      best_value = possible_split_values[i];
-      best_varID = varID;
-      best_logrank = logrank;
+    if (logrank > *best_logrank) {
+      *best_value = possible_split_values[i];
+      *best_varID = varID;
+      *best_logrank = logrank;
     }
   }
+
+  // Clean up
+  delete[] possible_split_values;
+  delete[] num_deaths_right_child;
+  delete[] delta_samples_at_risk_right_child;
+  delete[] num_samples_right_child;
 }
 
-void TreeSurvival::findBestSplitValueExtraTreesUnordered(size_t nodeID, size_t varID, double& best_value,
-    size_t& best_varID, double& best_logrank) {
+/////////////////////////////////////////////////////////////////////////////
+void TreeSurvival::findBestSplitValueExtraTreesUnordered(size_t nodeID, size_t varID, double* best_value,
+    size_t* best_varID, double* best_logrank) {
 
   size_t num_samples_node = end_pos[nodeID] - start_pos[nodeID];
   size_t num_unique_values = data->getNumUniqueDataValues(varID);
 
   // Get all factor indices in node
-  std::vector<bool> factor_in_node(num_unique_values, false);
+  bool* factor_in_node = new bool[num_unique_values]();
   for (size_t pos = start_pos[nodeID]; pos < end_pos[nodeID]; ++pos) {
     size_t sampleID = sampleIDs[pos];
     size_t index = data->getIndex(sampleID, varID);
@@ -820,54 +878,54 @@ void TreeSurvival::findBestSplitValueExtraTreesUnordered(size_t nodeID, size_t v
   }
 
   // Vector of indices in and out of node
-  std::vector<size_t> indices_in_node;
-  std::vector<size_t> indices_out_node;
-  indices_in_node.reserve(num_unique_values);
-  indices_out_node.reserve(num_unique_values);
+  size_t* indices_in_node = new size_t[num_unique_values];
+  size_t* indices_out_node = new size_t[num_unique_values];
+  size_t indices_in_node_count = 0;
+  size_t indices_out_node_count = 0;
   for (size_t i = 0; i < num_unique_values; ++i) {
     if (factor_in_node[i]) {
-      indices_in_node.push_back(i);
+      indices_in_node[indices_in_node_count++] = i;
     } else {
-      indices_out_node.push_back(i);
+      indices_out_node[indices_out_node_count++] = i;
     }
   }
 
   // Generate num_random_splits splits
   for (size_t i = 0; i < num_random_splits; ++i) {
-    std::vector<size_t> split_subset;
-    split_subset.reserve(num_unique_values);
+    size_t* split_subset = new size_t[num_unique_values];
+    size_t split_subset_count = 0;
 
     // Draw random subsets, sample all partitions with equal probability
-    if (indices_in_node.size() > 1) {
-      size_t num_partitions = (2ULL << (indices_in_node.size() - 1ULL)) - 2ULL; // 2^n-2 (don't allow full or empty)
+    if (indices_in_node_count > 1) {
+      size_t num_partitions = (2ULL << (indices_in_node_count - 1ULL)) - 2ULL; // 2^n-2 (don't allow full or empty)
       std::uniform_int_distribution<size_t> udist(1, num_partitions);
       size_t splitID_in_node = udist(random_number_generator);
-      for (size_t j = 0; j < indices_in_node.size(); ++j) {
+      for (size_t j = 0; j < indices_in_node_count; ++j) {
         if ((splitID_in_node & (1ULL << j)) > 0) {
-          split_subset.push_back(indices_in_node[j]);
+          split_subset[split_subset_count++] = indices_in_node[j];
         }
       }
     }
-    if (indices_out_node.size() > 1) {
-      size_t num_partitions = (2ULL << (indices_out_node.size() - 1ULL)) - 1ULL; // 2^n-1 (allow full or empty)
+    if (indices_out_node_count > 1) {
+      size_t num_partitions = (2ULL << (indices_out_node_count - 1ULL)) - 1ULL; // 2^n-1 (allow full or empty)
       std::uniform_int_distribution<size_t> udist(0, num_partitions);
       size_t splitID_out_node = udist(random_number_generator);
-      for (size_t j = 0; j < indices_out_node.size(); ++j) {
+      for (size_t j = 0; j < indices_out_node_count; ++j) {
         if ((splitID_out_node & (1ULL << j)) > 0) {
-          split_subset.push_back(indices_out_node[j]);
+          split_subset[split_subset_count++] = indices_out_node[j];
         }
       }
     }
 
     // Assign union of the two subsets to right child
     size_t splitID = 0;
-    for (auto& idx : split_subset) {
-      splitID |= 1ULL << idx;
+    for (size_t j = 0; j < split_subset_count; ++j) {
+      splitID |= 1ULL << split_subset[j];
     }
 
     // Initialize
-    std::vector<size_t> num_deaths_right_child(num_timepoints);
-    std::vector<size_t> delta_samples_at_risk_right_child(num_timepoints);
+    size_t* num_deaths_right_child = new size_t[num_timepoints]();
+    size_t* delta_samples_at_risk_right_child = new size_t[num_timepoints]();
     size_t num_samples_right_child = 0;
     double numerator = 0;
     double denominator_squared = 0;
@@ -888,12 +946,14 @@ void TreeSurvival::findBestSplitValueExtraTreesUnordered(size_t nodeID, size_t v
           ++num_deaths_right_child[survival_timeID];
         }
       }
-
     }
 
     // Stop if minimal node size reached
     size_t num_samples_left_child = num_samples_node - num_samples_right_child;
     if (num_samples_right_child < min_node_size || num_samples_left_child < min_node_size) {
+      delete[] split_subset;
+      delete[] num_deaths_right_child;
+      delete[] delta_samples_at_risk_right_child;
       continue;
     }
 
@@ -905,11 +965,11 @@ void TreeSurvival::findBestSplitValueExtraTreesUnordered(size_t nodeID, size_t v
       }
 
       if (num_deaths[t] > 0) {
-        // Numerator and demoninator for log-rank test, notation from Ishwaran et al.
-        double di = (double) num_deaths[t];
-        double di1 = (double) num_deaths_right_child[t];
-        double Yi = (double) num_samples_at_risk[t];
-        double Yi1 = (double) num_samples_at_risk_right_child;
+        // Numerator and denominator for log-rank test, notation from Ishwaran et al.
+        double di = static_cast<double>(num_deaths[t]);
+        double di1 = static_cast<double>(num_deaths_right_child[t]);
+        double Yi = static_cast<double>(num_samples_at_risk[t]);
+        double Yi1 = static_cast<double>(num_samples_at_risk_right_child);
         numerator += di1 - Yi1 * (di / Yi);
         denominator_squared += (Yi1 / Yi) * (1.0 - Yi1 / Yi) * ((Yi - di) / (Yi - 1)) * di;
       }
@@ -925,12 +985,22 @@ void TreeSurvival::findBestSplitValueExtraTreesUnordered(size_t nodeID, size_t v
     // Regularization
     regularize(logrank, varID);
 
-    if (logrank > best_logrank) {
-      best_value = splitID;
-      best_varID = varID;
-      best_logrank = logrank;
+    if (logrank > *best_logrank) {
+      *best_value = splitID;
+      *best_varID = varID;
+      *best_logrank = logrank;
     }
+
+    // Clean up
+    delete[] split_subset;
+    delete[] num_deaths_right_child;
+    delete[] delta_samples_at_risk_right_child;
   }
+
+  // Clean up
+  delete[] factor_in_node;
+  delete[] indices_in_node;
+  delete[] indices_out_node;
 }
 
 void TreeSurvival::addImpurityImportance(size_t nodeID, size_t varID, double decrease) {
@@ -945,5 +1015,4 @@ void TreeSurvival::addImpurityImportance(size_t nodeID, size_t varID, double dec
     (*variable_importance)[tempvarID] += decrease;
   }
 }
-
-} // namespace ranger
+// namespace ranger
