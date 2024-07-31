@@ -9,334 +9,220 @@
  R package "ranger" under GPL3 license.
  #-------------------------------------------------------------------------------*/
 
-#include <fstream>
-#include <sstream>
-#include <stdexcept>
-#include <algorithm>
-#include <iterator>
+#ifndef DATA_H_
+#define DATA_H_
 
-#include "Data.h"
-#include "utility.h"
+#include <iostream>
+#include <numeric>
+#include <random>
+#include <algorithm>
+#include <cstring> // Para operaciones de cadenas
+
+#include "globals.h"
 
 namespace ranger {
 
-Data::Data() :
-    num_rows(0), num_rows_rounded(0), num_cols(0), snp_data(0), num_cols_no_snp(0), externalData(true), index_data(0), max_num_unique_values(
-        0), order_snps(false) {
-}
+class Data {
+public:
+    Data() : variable_names(nullptr), num_rows(0), num_rows_rounded(0), num_cols(0), snp_data(nullptr),
+        num_cols_no_snp(0), externalData(false), index_data(nullptr), unique_data_values(nullptr),
+        max_num_unique_values(0), is_ordered_variable(nullptr), permuted_sampleIDs(nullptr),
+        snp_order(nullptr), order_snps(false) {}
 
-size_t Data::getVariableID(const std::string& variable_name) const {
-  auto it = std::find(variable_names.cbegin(), variable_names.cend(), variable_name);
-  if (it == variable_names.cend()) {
-    throw std::runtime_error("Variable " + variable_name + " not found.");
-  }
-  return (std::distance(variable_names.cbegin(), it));
-}
+    Data(const Data&) = delete;
+    Data& operator=(const Data&) = delete;
 
-// #nocov start (cannot be tested anymore because GenABEL not on CRAN)
-void Data::addSnpData(unsigned char* snp_data, size_t num_cols_snp) {
-  num_cols = num_cols_no_snp + num_cols_snp;
-  num_rows_rounded = roundToNextMultiple(num_rows, 4);
-  this->snp_data = snp_data;
-}
-// #nocov end
-
-// #nocov start
-bool Data::loadFromFile(std::string filename, std::vector<std::string>& dependent_variable_names) {
-
-  bool result;
-
-  // Open input file
-  std::ifstream input_file;
-  input_file.open(filename);
-  if (!input_file.good()) {
-    throw std::runtime_error("Could not open input file.");
-  }
-
-  // Count number of rows
-  size_t line_count = 0;
-  std::string line;
-  while (getline(input_file, line)) {
-    ++line_count;
-  }
-  num_rows = line_count - 1;
-  input_file.close();
-  input_file.open(filename);
-
-  // Check if comma, semicolon or whitespace seperated
-  std::string header_line;
-  getline(input_file, header_line);
-
-  // Find out if comma, semicolon or whitespace seperated and call appropriate method
-  if (header_line.find(',') != std::string::npos) {
-    result = loadFromFileOther(input_file, header_line, dependent_variable_names, ',');
-  } else if (header_line.find(';') != std::string::npos) {
-    result = loadFromFileOther(input_file, header_line, dependent_variable_names, ';');
-  } else {
-    result = loadFromFileWhitespace(input_file, header_line, dependent_variable_names);
-  }
-
-  externalData = false;
-  input_file.close();
-  return result;
-}
-
-bool Data::loadFromFileWhitespace(std::ifstream& input_file, std::string header_line,
-    std::vector<std::string>& dependent_variable_names) {
-
-  size_t num_dependent_variables = dependent_variable_names.size();
-  std::vector<size_t> dependent_varIDs;
-  dependent_varIDs.resize(num_dependent_variables);
-
-  // Read header
-  std::string header_token;
-  std::stringstream header_line_stream(header_line);
-  size_t col = 0;
-  while (header_line_stream >> header_token) {
-    bool is_dependent_var = false;
-    for (size_t i = 0; i < dependent_variable_names.size(); ++i) {
-      if (header_token == dependent_variable_names[i]) {
-        dependent_varIDs[i] = col;
-        is_dependent_var = true;
-      }
-    }
-    if (!is_dependent_var) {
-      variable_names.push_back(header_token);
-    }
-    ++col;
-  }
-
-  num_cols = variable_names.size();
-  num_cols_no_snp = num_cols;
-
-  // Read body
-  reserveMemory(num_dependent_variables);
-  bool error = false;
-  std::string line;
-  size_t row = 0;
-  while (getline(input_file, line)) {
-    double token;
-    std::stringstream line_stream(line);
-    size_t column = 0;
-    while (readFromStream(line_stream, token)) {
-      size_t column_x = column;
-      bool is_dependent_var = false;
-      for (size_t i = 0; i < dependent_varIDs.size(); ++i) {
-        if (column == dependent_varIDs[i]) {
-          set_y(i, row, token, error);
-          is_dependent_var = true;
-          break;
-        } else if (column > dependent_varIDs[i]) {
-          --column_x;
+    // Liberación de memoria manual
+    virtual ~Data() {
+        delete[] variable_names; // Cambio: Se eliminan vectores y se utilizan punteros
+        delete[] index_data; // Cambio: Se eliminan vectores y se utilizan punteros
+        for (size_t i = 0; i < num_cols; ++i) {
+            delete[] unique_data_values[i]; // Cambio: Se eliminan vectores y se utilizan punteros
         }
-      }
-      if (!is_dependent_var) {
-        set_x(column_x, row, token, error);
-      }
-      ++column;
-    }
-    if (column > (num_cols + num_dependent_variables)) {
-      throw std::runtime_error(
-          std::string("Could not open input file. Too many columns in row ") + std::to_string(row) + std::string("."));
-    } else if (column < (num_cols + num_dependent_variables)) {
-      throw std::runtime_error(
-          std::string("Could not open input file. Too few columns in row ") + std::to_string(row)
-              + std::string(". Are all values numeric?"));
-    }
-    ++row;
-  }
-  num_rows = row;
-  return error;
-}
-
-bool Data::loadFromFileOther(std::ifstream& input_file, std::string header_line,
-    std::vector<std::string>& dependent_variable_names, char seperator) {
-
-  size_t num_dependent_variables = dependent_variable_names.size();
-  std::vector<size_t> dependent_varIDs;
-  dependent_varIDs.resize(num_dependent_variables);
-
-  // Read header
-  std::string header_token;
-  std::stringstream header_line_stream(header_line);
-  size_t col = 0;
-  while (getline(header_line_stream, header_token, seperator)) {
-    bool is_dependent_var = false;
-    for (size_t i = 0; i < dependent_variable_names.size(); ++i) {
-      if (header_token == dependent_variable_names[i]) {
-        dependent_varIDs[i] = col;
-        is_dependent_var = true;
-      }
-    }
-    if (!is_dependent_var) {
-      variable_names.push_back(header_token);
-    }
-    ++col;
-  }
-
-  num_cols = variable_names.size();
-  num_cols_no_snp = num_cols;
-
-  // Read body
-  reserveMemory(num_dependent_variables);
-  bool error = false;
-  std::string line;
-  size_t row = 0;
-  while (getline(input_file, line)) {
-    std::string token_string;
-    double token;
-    std::stringstream line_stream(line);
-    size_t column = 0;
-    while (getline(line_stream, token_string, seperator)) {
-      std::stringstream token_stream(token_string);
-      readFromStream(token_stream, token);
-
-      size_t column_x = column;
-      bool is_dependent_var = false;
-      for (size_t i = 0; i < dependent_varIDs.size(); ++i) {
-        if (column == dependent_varIDs[i]) {
-          set_y(i, row, token, error);
-          is_dependent_var = true;
-          break;
-        } else if (column > dependent_varIDs[i]) {
-          --column_x;
+        delete[] unique_data_values; // Cambio: Se eliminan vectores y se utilizan punteros
+        delete[] is_ordered_variable; // Cambio: Se eliminan vectores y se utilizan punteros
+        delete[] permuted_sampleIDs; // Cambio: Se eliminan vectores y se utilizan punteros
+        for (size_t i = 0; i < num_cols_no_snp; ++i) {
+            delete[] snp_order[i]; // Cambio: Se eliminan vectores y se utilizan punteros
         }
-      }
-      if (!is_dependent_var) {
-        set_x(column_x, row, token, error);
-      }
-      ++column;
-    }
-    ++row;
-  }
-  num_rows = row;
-  return error;
-}
-// #nocov end
-
-void Data::getAllValues(std::vector<double>& all_values, std::vector<size_t>& sampleIDs, size_t varID, size_t start,
-    size_t end) const {
-
-  // All values for varID (no duplicates) for given sampleIDs
-  if (getUnpermutedVarID(varID) < num_cols_no_snp) {
-    
-    all_values.reserve(end - start);
-    for (size_t pos = start; pos < end; ++pos) {
-      all_values.push_back(get_x(sampleIDs[pos], varID));
-    }
-    std::sort(all_values.begin(), all_values.end());
-    all_values.erase(std::unique(all_values.begin(), all_values.end()), all_values.end());
-  } else {
-    // If GWA data just use 0, 1, 2
-    all_values = std::vector<double>( { 0, 1, 2 });
-  }
-}
-
-void Data::getMinMaxValues(double& min, double&max, std::vector<size_t>& sampleIDs, size_t varID, size_t start,
-    size_t end) const {
-  if (sampleIDs.size() > 0) {
-    min = get_x(sampleIDs[start], varID);
-    max = min;
-  }
-  for (size_t pos = start; pos < end; ++pos) {
-    double value = get_x(sampleIDs[pos], varID);
-    if (value < min) {
-      min = value;
-    }
-    if (value > max) {
-      max = value;
-    }
-  }
-}
-
-void Data::sort() {
-
-  // Reserve memory
-  index_data.resize(num_cols_no_snp * num_rows);
-
-  // For all columns, get unique values and save index for each observation
-  for (size_t col = 0; col < num_cols_no_snp; ++col) {
-
-    // Get all unique values
-    std::vector<double> unique_values(num_rows);
-    for (size_t row = 0; row < num_rows; ++row) {
-      unique_values[row] = get_x(row, col);
-    }
-    std::sort(unique_values.begin(), unique_values.end());
-    unique_values.erase(unique(unique_values.begin(), unique_values.end()), unique_values.end());
-
-    // Get index of unique value
-    for (size_t row = 0; row < num_rows; ++row) {
-      size_t idx = std::lower_bound(unique_values.begin(), unique_values.end(), get_x(row, col))
-          - unique_values.begin();
-      index_data[col * num_rows + row] = idx;
+        delete[] snp_order; // Cambio: Se eliminan vectores y se utilizan punteros
     }
 
-    // Save unique values
-    unique_data_values.push_back(unique_values);
-    if (unique_values.size() > max_num_unique_values) {
-      max_num_unique_values = unique_values.size();
-    }
-  }
-}
+    virtual double get_x(size_t row, size_t col) const = 0;
+    virtual double get_y(size_t row, size_t col) const = 0;
 
-// TODO: Implement ordering for multiclass and survival
-// #nocov start (cannot be tested anymore because GenABEL not on CRAN)
-void Data::orderSnpLevels(bool corrected_importance) {
-  // Stop if now SNP data
-  if (snp_data == 0) {
-    return;
-  }
+    size_t getVariableID(const std::string& variable_name) const;
 
-  size_t num_snps;
-  if (corrected_importance) {
-    num_snps = 2 * (num_cols - num_cols_no_snp);
-  } else {
-    num_snps = num_cols - num_cols_no_snp;
-  }
+    virtual void reserveMemory(size_t y_cols) = 0;
 
-  // Reserve space
-  snp_order.resize(num_snps, std::vector<size_t>(3));
+    virtual void set_x(size_t col, size_t row, double value, bool& error) = 0;
+    virtual void set_y(size_t col, size_t row, double value, bool& error) = 0;
 
-  // For each SNP
-  for (size_t i = 0; i < num_snps; ++i) {
-    size_t col = i;
-    if (i >= (num_cols - num_cols_no_snp)) {
-      // Get unpermuted SNP ID
-      col = i - num_cols + num_cols_no_snp;
-    }
+    void addSnpData(unsigned char* snp_data, size_t num_cols_snp);
 
-    // Order by mean response
-    std::vector<double> means(3, 0);
-    std::vector<double> counts(3, 0);
-    for (size_t row = 0; row < num_rows; ++row) {
-      size_t row_permuted = row;
-      if (i >= (num_cols - num_cols_no_snp)) {
-        row_permuted = getPermutedSampleID(row);
-      }
-      size_t idx = col * num_rows_rounded + row_permuted;
-      size_t value = (((snp_data[idx / 4] & mask[idx % 4]) >> offset[idx % 4]) - 1);
+    bool loadFromFile(std::string filename, std::string*& dependent_variable_names); // Cambio: vector a puntero
+    bool loadFromFileWhitespace(std::ifstream& input_file, std::string header_line,
+                                std::string*& dependent_variable_names); // Cambio: vector a puntero
+    bool loadFromFileOther(std::ifstream& input_file, std::string header_line,
+                           std::string*& dependent_variable_names, char seperator); // Cambio: vector a puntero
 
-      // TODO: Better way to treat missing values?
-      if (value > 2) {
-        value = 0;
-      }
+    void getAllValues(double*& all_values, size_t*& sampleIDs, size_t varID, size_t start,
+                      size_t end) const; // Cambio: vector a puntero
 
-      means[value] += get_y(row, 0);
-      ++counts[value];
+    void getMinMaxValues(double& min, double& max, size_t*& sampleIDs, size_t varID, size_t start,
+                         size_t end) const; // Cambio: vector a puntero
+
+    size_t getIndex(size_t row, size_t col) const {
+        size_t col_permuted = col;
+        if (col >= num_cols) {
+            col = getUnpermutedVarID(col);
+            row = getPermutedSampleID(row);
+        }
+
+        if (col < num_cols_no_snp) {
+            return index_data[col * num_rows + row]; // Cambio: Se eliminan vectores y se utilizan punteros
+        } else {
+            return getSnp(row, col, col_permuted); // Cambio: Se eliminan vectores y se utilizan punteros
+        }
     }
 
-    for (size_t value = 0; value < 3; ++value) {
-      means[value] /= counts[value];
+    size_t getSnp(size_t row, size_t col, size_t col_permuted) const {
+        size_t idx = (col - num_cols_no_snp) * num_rows_rounded + row;
+        size_t result = ((snp_data[idx / 4] & mask[idx % 4]) >> offset[idx % 4]) - 1;
+
+        if (result > 2) {
+            result = 0;
+        }
+
+        if (order_snps) {
+            if (col_permuted >= num_cols) {
+                result = snp_order[col_permuted - 2 * num_cols_no_snp][result]; // Cambio: Se eliminan vectores y se utilizan punteros
+            } else {
+                result = snp_order[col - num_cols_no_snp][result]; // Cambio: Se eliminan vectores y se utilizan punteros
+            }
+        }
+        return result;
     }
 
-    // Save order
-    snp_order[i] = order(means, false);
-  }
+    double getUniqueDataValue(size_t varID, size_t index) const {
+        if (varID >= num_cols) {
+            varID = getUnpermutedVarID(varID);
+        }
 
-  order_snps = true;
-}
-// #nocov end
+        if (varID < num_cols_no_snp) {
+            return unique_data_values[varID][index]; // Cambio: Se eliminan vectores y se utilizan punteros
+        } else {
+            return (index);
+        }
+    }
+
+    size_t getNumUniqueDataValues(size_t varID) const {
+        if (varID >= num_cols) {
+            varID = getUnpermutedVarID(varID);
+        }
+
+        if (varID < num_cols_no_snp) {
+            return max_num_unique_values; // Cambio: Se eliminan vectores y se utilizan punteros
+        } else {
+            return (3);
+        }
+    }
+
+    void sort();
+
+    void orderSnpLevels(bool corrected_importance);
+
+    const std::string* getVariableNames() const {
+        return variable_names; // Cambio: Se eliminan vectores y se utilizan punteros
+    }
+    size_t getNumCols() const {
+        return num_cols;
+    }
+    size_t getNumRows() const {
+        return num_rows;
+    }
+
+    size_t getMaxNumUniqueValues() const {
+        if (snp_data == nullptr || max_num_unique_values > 3) {
+            return max_num_unique_values;
+        } else {
+            return 3;
+        }
+    }
+
+    bool* getIsOrderedVariable() noexcept {
+        return is_ordered_variable; // Cambio: Se eliminan vectores y se utilizan punteros
+    }
+
+    void setIsOrderedVariable(const std::string* unordered_variable_names, size_t size) {
+        is_ordered_variable = new bool[num_cols]; // Cambio: Se eliminan vectores y se utilizan punteros
+        std::fill(is_ordered_variable, is_ordered_variable + num_cols, true); // Cambio: Se eliminan vectores y se utilizan punteros
+        for (size_t i = 0; i < size; ++i) {
+            size_t varID = getVariableID(unordered_variable_names[i]);
+            is_ordered_variable[varID] = false;
+        }
+    }
+
+    void setIsOrderedVariable(bool* is_ordered_variable) {
+        this->is_ordered_variable = is_ordered_variable; // Cambio: Se eliminan vectores y se utilizan punteros
+    }
+
+    bool isOrderedVariable(size_t varID) const {
+        if (varID >= num_cols) {
+            varID = getUnpermutedVarID(varID);
+        }
+        return is_ordered_variable[varID]; // Cambio: Se eliminan vectores y se utilizan punteros
+    }
+
+    void permuteSampleIDs(std::mt19937_64 random_number_generator) {
+        permuted_sampleIDs = new size_t[num_rows]; // Cambio: Se eliminan vectores y se utilizan punteros
+        std::iota(permuted_sampleIDs, permuted_sampleIDs + num_rows, 0); // Cambio: Se eliminan vectores y se utilizan punteros
+        std::shuffle(permuted_sampleIDs, permuted_sampleIDs + num_rows, random_number_generator); // Cambio: Se eliminan vectores y se utilizan punteros
+    }
+
+    size_t getPermutedSampleID(size_t sampleID) const {
+        return permuted_sampleIDs[sampleID]; // Cambio: Se eliminan vectores y se utilizan punteros
+    }
+
+    size_t getUnpermutedVarID(size_t varID) const {
+        if (varID >= num_cols) {
+            varID -= num_cols;
+        }
+        return varID;
+    }
+
+    const size_t* const* getSnpOrder() const {
+        return snp_order; // Cambio: Se eliminan vectores y se utilizan punteros
+    }
+
+    void setSnpOrder(size_t** snp_order) {
+        this->snp_order = snp_order; // Cambio: Se eliminan vectores y se utilizan punteros
+        order_snps = true;
+    }
+
+protected:
+    std::string* variable_names; // Cambio: Se eliminan vectores y se utilizan punteros
+    size_t num_rows;
+    size_t num_rows_rounded;
+    size_t num_cols;
+
+    unsigned char* snp_data;
+    size_t num_cols_no_snp;
+
+    bool externalData;
+
+    size_t* index_data; // Cambio: Se eliminan vectores y se utilizan punteros
+    double** unique_data_values; // Cambio: Se eliminan vectores y se utilizan punteros
+    size_t max_num_unique_values;
+
+    bool* is_ordered_variable; // Cambio: Se eliminan vectores y se utilizan punteros
+
+    size_t* permuted_sampleIDs; // Cambio: Se eliminan vectores y se utilizan punteros
+
+    size_t** snp_order; // Cambio: Se eliminan vectores y se utilizan punteros
+    bool order_snps;
+};
 
 } // namespace ranger
 
+#endif /* DATA_H_ */
